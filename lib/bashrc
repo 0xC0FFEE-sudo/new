@@ -1,0 +1,64 @@
+# /etc/newvm/bashrc - sourced from /root/.bashrc inside every newvm sandbox
+
+# ---- identity --------------------------------------------------------------
+export HOME=/root USER=root LOGNAME=root
+
+# ---- paths ----------------------------------------------------------------
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.deno/bin:/usr/local/go/bin:$HOME/go/bin:$PATH" ;;
+esac
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" 2>/dev/null
+command -v starship >/dev/null 2>&1 && eval "$(starship init bash 2>/dev/null)"
+command -v zoxide   >/dev/null 2>&1 && eval "$(zoxide init bash 2>/dev/null)"
+command -v atuin    >/dev/null 2>&1 && eval "$(atuin init 2>/dev/null)"
+command -v eza      >/dev/null 2>&1 && alias ls='eza --icons=auto --group-directories-first' 2>/dev/null
+
+# ---- history --------------------------------------------------------------
+HISTSIZE=200000
+HISTFILESIZE=400000
+HISTCONTROL=ignoreboth:erasedups
+shopt -s histappend checkwinsize cmdhist lithist
+shopt -s autocd dirspell 2>/dev/null
+PROMPT_COMMAND="history -a"
+
+# ---- behaviour ------------------------------------------------------------
+set -o vi 2>/dev/null || true
+alias ll='ls -alh --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias g='git'
+alias gst='git status -sb'
+alias gd='git diff'
+alias gl='git log --oneline --graph --decorate -20'
+alias cat='bat --paging=never --style=plain 2>/dev/null || /bin/cat'
+export LESS='-R -F -X'
+export PAGER='less -R'
+
+# ---- sandbox awareness ----------------------------------------------------
+export NEWVM=1
+alias vmexit='exit'
+newvm_info() {
+  printf '\n  project     %s\n  checkpoint  %s\n  parent      %s\n' \
+    "${NEWVM_PROJECT:-?}" "${NEWVM_CHECKPOINT:-?}" "${NEWVM_PARENT:-?}"
+  printf '  host folder %s (%s)\n  save        %s\n\n' \
+    "${NEWVM_HOSTDIR:-none}" "${NEWVM_MOUNT:-?}" "${NEWVM_SAVE:-?}"
+}
+newvm_help() {
+  cat <<'HELP'
+  newvm-doctor      check the toolchain and show versions
+  newvm-manifest    full inventory of what is installed
+  newvm-with TOOL   install an extra tool right now. `newvm-with` with no
+                    argument lists them: docker k8s rust bun deno dotnet go
+                    java php ruby elixir terraform chromium playwright
+                    postgres mysql redis aws gcloud ansible shellx tools
+  newvm-provision   re-run the toolchain builder (idempotent)
+  ncodex            codex with its own sandbox off (we already are one)
+  newvm_info        what session am I in?
+  vmexit            leave this sandbox (same as exit)
+  exit              leave - the sandbox saves itself automatically
+HELP
+}
+command -v direnv >/dev/null 2>&1 && direnv hook bash 2>/dev/null

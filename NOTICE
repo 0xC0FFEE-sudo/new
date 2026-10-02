@@ -1,0 +1,11 @@
+new (the `new` microVM sandbox launcher)
+Copyright 2026 newvm contributors
+
+This product includes software developed as part of the "new" project.
+
+This product depends on, but does not include, the shuru CLI
+(https://github.com/superhq-ai/shuru), which is licensed under the
+Apache License, Version 2.0.
+
+This project is not affiliated with, sponsored by, or endorsed by
+SuperHQ AI or the shuru project authors.

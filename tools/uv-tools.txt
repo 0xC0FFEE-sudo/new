@@ -1,0 +1,6 @@
+# Python CLI tools installed with `uv tool install` in stage 3.
+# After editing: new rebuild
+# More are available on demand: new --with ansible, new --with aws
+
+ruff
+llm

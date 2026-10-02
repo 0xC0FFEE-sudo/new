@@ -1,0 +1,9 @@
+# npm globals installed in stage 3 of the golden image (stage 1 already
+# provides node 22 LTS and npm). One per line or space separated.
+# After editing: new rebuild
+
+@openai/codex
+@anthropic-ai/claude-code
+@google/gemini-cli
+@github/copilot
+opencode-ai

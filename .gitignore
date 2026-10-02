@@ -1,0 +1,15 @@
+# Runtime state. NEVER COMMIT THIS: state/payload/ contains copies of your
+# Claude / Codex / Gemini credentials, and state/ckpt holds session metadata.
+state/
+*.ext4
+*.idx
+*.meta
+*.log
+*.tmp
+
+# local overrides
+config.env.local
+secrets.conf
+
+# macOS
+.DS_Store

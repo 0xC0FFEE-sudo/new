@@ -1,0 +1,1188 @@
+#!/usr/bin/env bash
+# new - one-keyword ephemeral microVM dev sandbox, built on shuru.
+#
+#   new                 boot the sandbox for the current folder (auto checkpoint)
+#   new <dir>           ... for another folder
+#   new --help          the full option list
+#
+# How it works
+#   * Tool installs happen once, into a base checkpoint (newvm-base), built in
+#     stages so a failed download does not cost the stages before it.
+#   * Each session boots that checkpoint in ~0.3s, mounts the folder at
+#     /workspace, and saves itself as a checkpoint when the shell exits.
+#   * API keys passed as environment variables are substituted by shuru's proxy
+#     and never enter the VM. Agent login files are copied in on request; see
+#     --no-sync-auth and SECURITY.md.
+
+set -uo pipefail
+
+NEWVM_VERSION="1.0.0"
+APP_DIR="$HOME/.local/share/newvm"
+LIB_DIR="$APP_DIR/lib"
+STATE_DIR="$APP_DIR/state"
+LOG_DIR="$STATE_DIR/logs"
+META_DIR="$STATE_DIR/ckpt"
+PAYLOAD_DIR="$STATE_DIR/payload"
+CKPT_DIR="$HOME/.local/share/shuru/checkpoints"
+CFG="$HOME/.config/newvm/config.env"
+SECRETS_CONF="$HOME/.config/newvm/secrets.conf"
+BASE_STAGES=3
+GUEST_WORKSPACE=/workspace
+
+if [ -t 2 ]; then
+  C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_R=$'\033[31m'; C_G=$'\033[32m'
+  C_Y=$'\033[33m'; C_C=$'\033[36m'; C_0=$'\033[0m'
+else
+  C_DIM=""; C_B=""; C_R=""; C_G=""; C_Y=""; C_C=""; C_0=""
+fi
+log()  { printf '%snew%s %s\n' "$C_C" "$C_0" "$*" >&2; }
+info() { printf '%s      %s%s\n' "$C_DIM" "$*" "$C_0" >&2; }
+ok()   { printf '%s  ok%s %s\n' "$C_G" "$C_0" "$*" >&2; }
+warn() { printf '%swarn%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+err()  { printf '%s err%s %s\n' "$C_R" "$C_0" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+hr()   { printf '%s%s%s\n' "$C_DIM" "--------------------------------------------------------------" "$C_0" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+mkdirs() {
+  mkdir -p "$LIB_DIR" "$STATE_DIR" "$LOG_DIR" "$META_DIR" \
+           "$PAYLOAD_DIR" "$APP_DIR/tools" "$HOME/.config/newvm" 2>/dev/null \
+    || die "cannot create $APP_DIR - is \$HOME writable?"
+  # state can hold copies of your agent credentials: keep it private
+  chmod 700 "$STATE_DIR" "$PAYLOAD_DIR" "$META_DIR" 2>/dev/null
+}
+
+hash_stdin8() { shasum 2>/dev/null | cut -c1-8; }
+str_hash8()   { printf '%s' "$1" | hash_stdin8; }
+
+slugify() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9._-' '-' \
+                  | cut -c1-28 | sed 's/^[-.]*//; s/[-.]*$//'; }
+
+resolve_dir() { [ -d "$1" ] || die "not a directory: $1"; (cd "$1" 2>/dev/null && pwd -P) || die "cannot enter $1"; }
+
+hw_cpus() { _n=$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4); [ "$_n" -gt 8 ] && _n=8; [ "$_n" -lt 2 ] && _n=2; printf '%s' "$_n"; }
+
+# ------------------------------------------------------------ checkpoints ---
+ckpt_path()  { printf '%s/%s' "$CKPT_DIR" "$1"; }
+ckpt_exists(){ _p=$(ckpt_path "$1"); [ -f "$_p.ext4" ] || [ -f "$_p.idx" ]; }
+ckpt_delete(){ ckpt_exists "$1" && shuru checkpoint delete "$1" >/dev/null 2>&1; rm -f "$META_DIR/$1.meta"; return 0; }
+ckpt_bytes() { _p=$(ckpt_path "$1"); [ -f "$_p.ext4" ] && printf '%s' "$_p.ext4" || printf '%s' "$_p.idx"; }
+
+meta_get() { _f="$META_DIR/$1.meta"; [ -f "$_f" ] || { printf ''; return; }; sed -n "s/^$2=//p" "$_f" | head -1; }
+meta_upd() { _f="$META_DIR/$1.meta"; _t=$(mktemp "$META_DIR/.meta.XXXXXX" 2>/dev/null) || return 1
+             touch "$_f"; grep -v "^$2=" "$_f" > "$_t" 2>/dev/null
+             printf '%s=%s\n' "$2" "$3" >> "$_t"; mv "$_t" "$_f"; }
+
+human_date() { case "$1" in *T*) printf '%s' "$(printf '%s' "$1" | cut -dT -f1)";; *) printf '%s' "$1";; esac; }
+
+# ------------------------------------------------------------------ config ---
+ENV_KEYS="NEW_MEM NEW_CPUS NEW_DISK NEW_SAVE NEW_MOUNT NEW_PROFILE NEW_BASE NEW_NET NEW_SECRETS NEW_SYNC_AUTH NEW_EXTRAS NEW_PORTS NEW_HOSTS NEW_SHELL NEW_WITH NEW_NO_BUILD NEW_SYNC_SSH NEW_SYNC_GITCONFIG"
+
+load_config() {
+  for _v in $ENV_KEYS; do eval "_e_${_v}=\"\${${_v}-}\""; done
+  [ -f "$APP_DIR/config.env" ] && . "$APP_DIR/config.env"
+  [ -f "$CFG" ] && . "$CFG"
+  for _v in $ENV_KEYS; do
+    eval "_cur=\${${_v}-}"; eval "_env=\${_e_${_v}-}"
+    if [ -n "$_env" ]; then eval "${_v}=\$_env"; fi
+    unset "_cur" "_env"
+  done
+}
+
+apply_defaults() {
+  : "${NEW_MEM:=8192}"
+  : "${NEW_CPUS:=$(hw_cpus)}"
+  : "${NEW_DISK:=102400}"
+  : "${NEW_SAVE:=auto}"
+  : "${NEW_MOUNT:=ro}"
+  : "${NEW_PROFILE:=full}"
+  : "${NEW_BASE:=newvm-base}"
+  : "${NEW_NET:=on}"
+  : "${NEW_SECRETS:=on}"
+  : "${NEW_SYNC_AUTH:=1}"
+  : "${NEW_SYNC_SSH:=0}"
+  : "${NEW_SYNC_GITCONFIG:=1}"
+  : "${NEW_EXTRAS:=}"
+  : "${NEW_PORTS:=}"
+  : "${NEW_HOSTS:=}"
+  : "${NEW_SHELL:=bash}"
+  : "${NEW_WITH:=}"
+  : "${NEW_NO_BUILD:=0}"
+  : "${NEW_NO_MOUNT:=0}"
+  : "${SHURU_OPTIONAL:=0}"
+}
+
+recipe_hash() {
+  { cat "$LIB_DIR/provision.sh" "$LIB_DIR/with.sh" 2>/dev/null
+    cat "$APP_DIR/tools/"*.txt 2>/dev/null
+    printf 'profile=%s\nextras=%s\n' "$NEW_PROFILE" "$NEW_EXTRAS"
+    shuru --version 2>/dev/null; } | hash_stdin8
+}
+
+auth_hash() {
+  { for f in "$HOME/.claude/.credentials.json" "$HOME/.claude/settings.json" \
+             "$HOME/.codex/auth.json" "$HOME/.codex/config.toml" \
+             "$HOME/.local/share/opencode/auth.json" \
+             "$HOME/.gemini/oauth_creds.json" "$HOME/.config/gh/hosts.yml" \
+             "$HOME/.gitconfig"; do
+      [ -f "$f" ] || continue
+      printf '%s:' "$f"; shasum "$f" 2>/dev/null | cut -c1-12
+    done; } | hash_stdin8
+}
+
+# ----------------------------------------------------------------- secrets ---
+builtin_secrets() { cat <<'EOF'
+OPENAI_API_KEY=OPENAI_API_KEY@api.openai.com
+ANTHROPIC_API_KEY=ANTHROPIC_API_KEY@api.anthropic.com
+CLAUDE_CODE_OAUTH_TOKEN=CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com
+GEMINI_API_KEY=GEMINI_API_KEY@generativelanguage.googleapis.com,aistudio.googleapis.com
+GOOGLE_API_KEY=GOOGLE_API_KEY@generativelanguage.googleapis.com
+XAI_API_KEY=XAI_API_KEY@api.x.ai
+GROQ_API_KEY=GROQ_API_KEY@api.groq.com
+OPENROUTER_API_KEY=OPENROUTER_API_KEY@openrouter.ai
+MISTRAL_API_KEY=MISTRAL_API_KEY@api.mistral.ai
+DEEPSEEK_API_KEY=DEEPSEEK_API_KEY@api.deepseek.com
+TOGETHER_API_KEY=TOGETHER_API_KEY@api.together.xyz
+PERPLEXITY_API_KEY=PERPLEXITY_API_KEY@api.perplexity.ai
+COHERE_API_KEY=COHERE_API_KEY@api.cohere.ai
+FIREWORKS_API_KEY=FIREWORKS_API_KEY@api.fireworks.ai
+GITHUB_TOKEN=GITHUB_TOKEN@api.github.com,github.com,codeload.github.com,raw.githubusercontent.com,objects.githubusercontent.com,avatars.githubusercontent.com
+GH_TOKEN=GH_TOKEN@api.github.com,github.com,codeload.github.com,raw.githubusercontent.com
+NPM_TOKEN=NPM_TOKEN@registry.npmjs.org
+DOCKERHUB_TOKEN=DOCKERHUB_TOKEN@registry-1.docker.io,auth.docker.io
+EOF
+}
+
+secret_specs() {
+  [ -f "$SECRETS_CONF" ] && grep -vE '^[[:space:]]*(#|$)' "$SECRETS_CONF"
+  builtin_secrets
+}
+
+secret_names() {
+  _out=""
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue;; esac
+    name=${line%%=*}; rest=${line#*=}; envvar=${rest%%@*}; hosts=${rest#*@}
+    [ "$hosts" = "$rest" ] && continue
+    eval "_v=\${$envvar:-}"
+    [ -n "$_v" ] || continue
+    _out="$_out ${name}"
+  done <<EOF
+$(secret_specs)
+EOF
+  printf '%s' "$_out"
+}
+
+# ----------------------------------------------------------------- payload ---
+copy_if() { [ -f "$1" ] && cp "$1" "$2" 2>/dev/null; return 0; }
+
+build_payload() {
+  _old_umask=$(umask); umask 077          # payloads may carry credentials
+  rm -rf "$PAYLOAD_DIR"
+  mkdir -p "$PAYLOAD_DIR/payload/root/.claude" "$PAYLOAD_DIR/payload/root/.codex" \
+           "$PAYLOAD_DIR/payload/root/.local/share/opencode" "$PAYLOAD_DIR/payload/root/.gemini" \
+           "$PAYLOAD_DIR/payload/root/.config/gh" "$PAYLOAD_DIR/payload/root/.ssh" "$PAYLOAD_DIR/tools"
+  chmod 700 "$PAYLOAD_DIR" "$PAYLOAD_DIR/payload" "$PAYLOAD_DIR/payload/root" 2>/dev/null
+  cp "$LIB_DIR/provision.sh" "$LIB_DIR/apply.sh" "$LIB_DIR/session.sh" \
+     "$LIB_DIR/bashrc" "$LIB_DIR/manifest.sh" "$LIB_DIR/with.sh" "$PAYLOAD_DIR/" 2>/dev/null
+  cp "$APP_DIR"/tools/*.txt "$PAYLOAD_DIR/tools/" 2>/dev/null
+  {
+    printf 'NEWVM_VERSION=%s\nNEWVM_PROFILE=%s\nNEWVM_EXTRAS=%s\nNEWVM_RECIPE=%s\n' \
+      "$NEWVM_VERSION" "$NEW_PROFILE" "$NEW_EXTRAS" "$(recipe_hash)"
+    printf 'NEWVM_MEM=%s\nNEWVM_DISK=%s\nNEWVM_CPUS=%s\nNEWVM_BUILT=%s\nNEWVM_AUTH=%s\n' \
+      "$NEW_MEM" "$NEW_DISK" "$NEW_CPUS" "$(date -u +%FT%TZ)" "$(auth_hash)"
+  } > "$PAYLOAD_DIR/build.conf"
+
+  if [ "$NEW_SYNC_AUTH" = "1" ]; then
+    P="$PAYLOAD_DIR/payload/root"
+    copy_if "$HOME/.claude/.credentials.json"        "$P/.claude/.credentials.json"
+    copy_if "$HOME/.claude/settings.json"            "$P/.claude/settings.json"
+    copy_if "$HOME/.codex/auth.json"                 "$P/.codex/auth.json"
+    copy_if "$HOME/.codex/config.toml"               "$P/.codex/config.toml"
+    copy_if "$HOME/.local/share/opencode/auth.json"  "$P/.local/share/opencode/auth.json"
+    copy_if "$HOME/.gemini/oauth_creds.json"         "$P/.gemini/oauth_creds.json"
+    copy_if "$HOME/.gemini/settings.json"            "$P/.gemini/settings.json"
+    copy_if "$HOME/.config/gh/hosts.yml"             "$P/.config/gh/hosts.yml"
+    [ "$NEW_SYNC_GITCONFIG" = "1" ] && copy_if "$HOME/.gitconfig" "$P/.gitconfig"
+    if [ "$NEW_SYNC_SSH" = "1" ]; then
+      for k in "$HOME"/.ssh/id_*; do
+        [ -f "$k" ] || continue
+        cp "$k" "$P/.ssh/" 2>/dev/null
+        case "$k" in *.pub) ;; *) chmod 600 "$P/.ssh/$(basename "$k")" 2>/dev/null;; esac
+      done
+      chmod 700 "$P/.ssh" 2>/dev/null
+    fi
+    # credentials are private, always
+    find "$PAYLOAD_DIR/payload/root" -type f -exec chmod 600 {} + 2>/dev/null
+    find "$PAYLOAD_DIR/payload/root" -type d -exec chmod 700 {} + 2>/dev/null
+  fi
+  umask "$_old_umask"
+}
+
+# Drop the credential copies from the host staging area once they are packed.
+purge_payload_credentials() {
+  rm -rf "$PAYLOAD_DIR/payload/root/.claude" "$PAYLOAD_DIR/payload/root/.codex" \
+         "$PAYLOAD_DIR/payload/root/.gemini" "$PAYLOAD_DIR/payload/root/.ssh" \
+         "$PAYLOAD_DIR/payload/root/.config" "$PAYLOAD_DIR/payload/root/.local" \
+         "$PAYLOAD_DIR/payload/root/.gitconfig" 2>/dev/null
+}
+
+cat > "$PAYLOAD_DIR/bootstrap.sh" <<'BOOT'
+#!/bin/sh
+marker="$1"; action="$2"; stage="$3"
+shift 3
+mkdir -p /newvm-build || exit 1
+: > /tmp/newvm.b64
+for c in "$@"; do printf %s "$c" >> /tmp/newvm.b64; done
+base64 -d /tmp/newvm.b64 > /tmp/newvm.tgz || { echo "payload: base64 decode failed"; exit 1; }
+tar -xzf /tmp/newvm.tgz -C /newvm-build || { echo "payload: extract failed"; exit 1; }
+rm -f /tmp/newvm.b64 /tmp/newvm.tgz
+[ "$stage" = "none" ] && stage=""
+exec bash /newvm-build/apply.sh "$marker" "$action" "$stage"
+BOOT
+
+# Guest argv for a payload-carrying boot. shuru never forwards stdin EOF, so
+# the payload travels as gzip+base64 chunks in argv (Linux caps one argv entry
+# at 128 KB, hence the chunking).
+BOOT_SCRIPT='
+n="$1"; marker="$2"; action="$3"; stage="$4"
+shift 4
+mkdir -p /newvm-build || exit 1
+: > /tmp/newvm.b64
+i=0
+for c in "$@"; do i=$((i+1)); if [ $i -le $n ]; then printf %s "$c" >> /tmp/newvm.b64; fi; done
+shift $n
+if [ -s /tmp/newvm.b64 ]; then
+  base64 -d /tmp/newvm.b64 > /tmp/newvm.tgz || echo "payload: base64 decode failed"
+  tar -xzf /tmp/newvm.tgz -C /newvm-build 2>/dev/null || echo "payload: extract failed"
+  rm -f /tmp/newvm.b64 /tmp/newvm.tgz
+  if [ "$action" = "session" ]; then
+    bash /newvm-build/apply.sh "$marker" "$action" "$stage" >/dev/null 2>&1
+  else
+    bash /newvm-build/apply.sh "$marker" "$action" "$stage"
+  fi
+  _rc=$?
+else
+  _rc=0
+fi
+# no trailing arguments means this is a build/refresh boot, not a session
+if [ $# -eq 0 ]; then exit $_rc; fi
+exec /usr/local/bin/newvm-session "$@"
+'
+
+payload_cmd() { # marker action stage [trailing args...] -> fills BOOT_ARGV
+  _b64=$(COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf - -C "$PAYLOAD_DIR" . 2>/dev/null | base64 | tr -d '\n')
+  [ -n "$_b64" ] || { err "could not build the guest payload"; return 1; }
+  BOOT_ARGV=(sh -c "$BOOT_SCRIPT" newvm "$1" "$2" "${3:-none}")
+  _n=$(printf %s "$_b64" | wc -c | tr -d ' ')
+  while [ "$_n" -gt 40000 ]; do
+    BOOT_ARGV+=("$(printf %s "$_b64" | cut -c1-40000)")
+    _b64=$(printf %s "$_b64" | cut -c40001-)
+    _n=$(printf %s "$_b64" | wc -c | tr -d ' ')
+  done
+  [ -n "$_b64" ] && BOOT_ARGV+=("$_b64")
+  # sh -c SCRIPT name(=newvm) count marker action stage <chunks...> <args...>
+  _count=$(( ${#BOOT_ARGV[@]} - 7 ))
+  BOOT_ARGV=("${BOOT_ARGV[@]:0:4}" "$_count" "${BOOT_ARGV[@]:4}")
+  if [ $# -gt 3 ]; then
+    shift 3
+    BOOT_ARGV+=("$@")
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------- guest script --
+
+# ------------------------------------------------------------ base builder ---
+# Move a checkpoint aside: clone (instant) then unlink the original.
+move_checkpoint() {
+  local _src _e
+  promote_checkpoint "$1" "$2" || return 1
+  _src=$(ckpt_path "$1")
+  for _e in ext4 idx; do rm -f "$_src.$_e"; done
+  return 0
+}
+
+# APFS clone: instant, costs no extra space for a sparse 100 GB image.
+promote_checkpoint() {
+  # Copies every format this checkpoint may have (.ext4 direct, .idx CAS).
+  # An APFS clone is instant; the plain cp is the fallback for other volumes.
+  local _src _dst _e _ok=1 _any=0
+  _src=$(ckpt_path "$1"); _dst=$(ckpt_path "$2")
+  for _e in ext4 idx; do
+    [ -f "$_src.$_e" ] || continue
+    _any=1
+    cp -c "$_src.$_e" "$_dst.$_e" 2>/dev/null || cp "$_src.$_e" "$_dst.$_e" 2>/dev/null \
+      || { rm -f "$_dst.$_e"; _ok=0; }
+  done
+  [ "$_any" = "1" ] || return 1
+  return $(( 1 - _ok ))     # _ok=1 means success
+}
+
+ensure_base() {
+  # rebuild = 1|0, arg2 = for 'rebuild N': drop stages after N and rebuild the
+  # rest; for 'build N': only build up to stage N.
+  local rebuild="$1" arg2="${2:-}" maxstage="" keep_from="" recipe name parent logf rc i partial
+  [ -n "$arg2" ] && [ "$arg2" -ge 1 ] 2>/dev/null && [ "$arg2" -le "$BASE_STAGES" ] 2>/dev/null || arg2=""
+  if [ "$rebuild" = "1" ]; then
+    keep_from="$arg2"
+  else
+    maxstage="$arg2"
+  fi
+  recipe=$(recipe_hash)
+
+  if [ "$rebuild" = "1" ]; then
+    if [ -n "$keep_from" ]; then
+      log "keeping stages 1-$keep_from, rebuilding stage $((keep_from+1)) onwards"
+      for i in $(seq $((keep_from+1)) "$BASE_STAGES"); do
+        ckpt_delete "$NEW_BASE-$i"; ckpt_delete "$NEW_BASE-${i}p"
+      done
+    else
+      log "rebuilding the golden image from scratch"
+      for i in $(seq 1 "$BASE_STAGES"); do ckpt_delete "$NEW_BASE-$i"; ckpt_delete "$NEW_BASE-${i}p"; done
+    fi
+    ckpt_delete "$NEW_BASE"
+  fi
+
+  if ckpt_exists "$NEW_BASE"; then
+    # Never rebuild automatically: the payload refreshes the runner scripts on
+    # every boot, so an older image is still fully usable.
+    if [ -z "$(meta_get "$NEW_BASE" recipe)" ]; then
+      info "no build metadata for '$NEW_BASE' (run 'new rebuild' to re-record it)"
+    elif [ "$(meta_get "$NEW_BASE" recipe)" != "$recipe" ]; then
+      info "note: the image predates the current toolchain recipe"
+      info "      'new rebuild' refreshes the toolchain (runners already update every boot)"
+    fi
+    return 0
+  fi
+
+  [ "$NEW_NO_BUILD" = "1" ] && die "no golden image '$NEW_BASE' and --no-build was given (run: new build)"
+
+  log "no golden image yet - building it once now (10-30 min, resumable)"
+  info "disk=${NEW_DISK}MB ram=${NEW_MEM}MB cpus=${NEW_CPUS} profile=$NEW_PROFILE extras=${NEW_EXTRAS:-none}"
+  build_payload
+
+  parent=""; i=1
+  while [ "$i" -le "$BASE_STAGES" ]; do
+    [ -n "$maxstage" ] && [ "$i" -gt "$maxstage" ] && break
+    name="$NEW_BASE-$i"
+    partial="$NEW_BASE-${i}p"
+    logf="$LOG_DIR/base-stage-$i.log"
+    build_payload   # refresh the payload before every stage
+
+    if ckpt_exists "$name"; then
+      info "stage $i already checkpointed ($name) - skipping"
+      parent="$name"; i=$((i+1)); continue
+    fi
+
+    if ckpt_exists "$partial"; then
+      info "resuming the partial stage from '$partial'"
+      from="$partial"
+    elif [ -n "$parent" ]; then
+      from="$parent"
+    else
+      from=""
+    fi
+
+    log "stage $i/$BASE_STAGES -> '$name'"
+    printf '### %s stage %i/%i parent=%s recipe=%s\n' "$(date -u +%FT%TZ)" "$i" "$BASE_STAGES" "${from:-base-image}" "$recipe" > "$logf"
+
+    payload_cmd "$name" build "$i" || die "payload build failed"
+    if [ -n "$from" ]; then
+      shuru checkpoint create "$name" --from "$from" \
+        --cpus "$NEW_CPUS" --memory "$NEW_MEM" --disk-size "$NEW_DISK" --allow-net \
+        -- "${BOOT_ARGV[@]}" 2>&1 | tee -a "$logf" | sed 's/^/    /' >&2
+    else
+      shuru checkpoint create "$name" \
+        --cpus "$NEW_CPUS" --memory "$NEW_MEM" --disk-size "$NEW_DISK" --allow-net \
+        -- "${BOOT_ARGV[@]}" 2>&1 | tee -a "$logf" | sed 's/^/    /' >&2
+    fi
+    rc=$?
+
+    if ! ckpt_exists "$name"; then
+      warn "stage $i produced no checkpoint - see $logf"
+      return 1
+    fi
+    if [ $rc -ne 0 ]; then
+      warn "stage $i exited $rc - keeping the partial image for the next attempt"
+      _src=$(ckpt_bytes "$name"); _ext="${_src##*.}"
+      mv "$_src" "$(ckpt_path "$partial").$_ext" && rm -f "$(ckpt_path "$name").$_ext"
+      meta_upd "$partial" status failed
+      meta_upd "$partial" stage "$i"
+      meta_upd "$partial" disk "$NEW_DISK"
+      info "fix the cause, then run 'new' again to resume at stage $i"
+      return 1
+    fi
+    ckpt_delete "$partial"
+    meta_upd "$name" recipe "$recipe"; meta_upd "$name" stage "$i"
+    meta_upd "$name" disk "$NEW_DISK";  meta_upd "$name" saved "$(date -u +%FT%TZ)"
+    meta_upd "$name" auth "$(auth_hash)"
+    parent="$name"; i=$((i+1))
+  done
+
+  if [ -n "$maxstage" ] && [ "$maxstage" -lt "$BASE_STAGES" ]; then
+    ok "stages through $maxstage are checkpointed - run 'new build' to continue"
+    return 0
+  fi
+  # Promote to a temporary name first: if the copy fails we must not be left
+  # with no image at all.
+  ckpt_delete "$NEW_BASE-new"
+  promote_checkpoint "$NEW_BASE-$BASE_STAGES" "$NEW_BASE-new" || die "could not promote the final stage"
+  ckpt_delete "$NEW_BASE"
+  promote_checkpoint "$NEW_BASE-new" "$NEW_BASE" || die "could not swap in the new image"
+  ckpt_delete "$NEW_BASE-new"
+  meta_upd "$NEW_BASE" recipe "$recipe"; meta_upd "$NEW_BASE" disk "$NEW_DISK"
+  meta_upd "$NEW_BASE" shuru "$(shuru --version 2>/dev/null)"
+  meta_upd "$NEW_BASE" auth "$(auth_hash)"
+  meta_upd "$NEW_BASE" saved "$(date -u +%FT%TZ)"
+  meta_upd "$NEW_BASE" session 1
+  ok "golden image ready: $NEW_BASE"
+}
+
+# --------------------------------------------------------------------- lock --
+LOCK_DIR=""
+lock_acquire() {
+  LOCK_DIR="$STATE_DIR/lock-$1"
+  mkdir -p "$STATE_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    _pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+      die "another session is already running for $2 (pid $_pid)"
+    fi
+    rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR" || die "cannot create the lock directory"
+  fi
+  printf '%s' "$$" > "$LOCK_DIR/pid"
+}
+lock_release() { [ -n "$LOCK_DIR" ] && rm -rf "$LOCK_DIR"; return 0; }
+
+# --------------------------------------------------------------- subcommands -
+proj_name() {
+  _slug=$(slugify "$(basename "$1")"); [ -n "$_slug" ] || _slug=project
+  printf 'newvm-proj-%s-%s' "$_slug" "$(str_hash8 "$1")"
+}
+prev_name() { printf 'newvm-prev-%s' "$(printf '%s' "$1" | sed 's/^newvm-proj-//')"; }
+
+cmd_list() {
+  local cur f name path disk bytes tag
+  resolve_project
+  cur="$PROJ_CKPT"
+  hr; printf '  %sgolden toolchain image%s\n' "$C_B" "$C_0"
+  if ckpt_exists "$NEW_BASE"; then
+    printf '    %-38s %s  disk=%-7s recipe=%s\n' "$NEW_BASE" "$(human_date "$(meta_get "$NEW_BASE" saved)")" \
+      "$(meta_get "$NEW_BASE" disk)" "$(meta_get "$NEW_BASE" recipe)"
+    for i in $(seq 1 "$BASE_STAGES"); do
+      ckpt_exists "$NEW_BASE-$i" && printf '    %-38s build stage %s of %s\n' "$NEW_BASE-$i" "$i" "$BASE_STAGES"
+      ckpt_exists "$NEW_BASE-${i}p" && printf '    %-38s partial stage %s (a failed build will resume here)\n' "$NEW_BASE-${i}p" "$i"
+    done
+  else
+    printf '    %-38s not built yet - run '"'"'new build'"'"'\n' "$NEW_BASE"
+  fi
+
+  _n=0
+  for _f in "$CKPT_DIR"/*.ext4 "$CKPT_DIR"/*.idx; do [ -f "$_f" ] && _n=$((_n+1)); done
+  printf '  %scheckpoints%s   %s total\n' "$C_B" "$C_0" "$_n"
+  for f in "$CKPT_DIR"/*.ext4 "$CKPT_DIR"/*.idx; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f"); name=${name%.*}
+    path=$(meta_get "$name" path)
+    disk=$(meta_get "$name" disk)
+    if [ -n "$(meta_get "$name" parent)" ] && [ -z "$path" ]; then
+      tag="snapshot of $(meta_get "$name" parent)"
+    elif [ -n "$path" ]; then
+      tag="$path"
+    elif [ "$name" = "$NEW_BASE" ] || [ "${name#$NEW_BASE-}" != "$name" ]; then
+      tag="toolchain image"
+    else
+      tag="(external)"
+    fi
+    bytes=$(du -h "$f" 2>/dev/null | cut -f1)
+    printf '    %-38s %-8s %-11s %s\n' "$name" "$bytes" "${disk:-?}" "$tag"
+    [ "$name" = "$cur" ] && printf '      %s^ the sandbox for this folder%s\n' "$C_G" "$C_0"
+  done
+  [ -z "$(ls "$CKPT_DIR"/*.ext4 "$CKPT_DIR"/*.idx 2>/dev/null)" ] && printf '    (none)\n'
+  hr
+}
+
+cmd_status() {
+  resolve_project
+  _n="$PROJ_CKPT"
+  printf '  folder       %s\n' "$PROJ_DIR"
+  printf '  checkpoint   %s%s\n' "$_n" "$(ckpt_exists "$_n" && printf ' (saved, will resume)' || printf ' (new)')"
+  printf '  parent       %s\n' "$(ckpt_exists "$_n" && printf '%s' "$_n" || printf '%s' "$NEW_BASE")"
+  printf '  resources    %s cpus / %s MB ram / %s MB disk\n' "$NEW_CPUS" "$NEW_MEM" "$(resume_disk "$_n")"
+  printf '  mount        %s\n' "$([ "$NEW_MOUNT" = none ] && printf 'none' || printf '/workspace <- %s (%s)' "$PWD" "$NEW_MOUNT")"
+  printf '  network      %s%s\n' "$([ "$NEW_NET" = off ] && printf 'off' || printf 'on')" \
+    "$([ -n "$NEW_HOSTS" ] && printf ' restricted to %s' "$NEW_HOSTS")"
+  if [ "$NEW_SECRETS" = off ]; then _sec="off"; else _sec="auto-detected:$(secret_names)"; fi
+  printf '  secrets      %s\n' "$_sec"
+  printf '  save on exit %s\n' "$NEW_SAVE"
+  if ckpt_exists "$NEW_BASE"; then
+    _ri=$([ "$(meta_get "$NEW_BASE" recipe)" = "$(recipe_hash)" ] && printf ' (up to date)' || printf ' (recipe changed - new rebuild)')
+  else
+    _ri=" (not built yet)"
+  fi
+  printf '  image        %s%s\n' "$NEW_BASE" "$_ri"
+  printf '  config       %s\n' "$CFG"
+}
+
+cmd_env() {
+  resolve_project
+  _n="$PROJ_CKPT"
+  cat <<EOF
+NEWVM_VERSION=$NEWVM_VERSION
+PROJ_DIR=$PROJ_DIR
+PROJ_CKPT=$_n
+PROJ_PARENT=$(ckpt_exists "$_n" && printf '%s' "$_n" || printf '%s' "$NEW_BASE")
+BASE=$NEW_BASE
+MEM=$NEW_MEM
+CPUS=$NEW_CPUS
+DISK=$(resume_disk "$_n")
+SAVE=$NEW_SAVE
+MOUNT=$NEW_MOUNT
+NET=$NEW_NET
+HOSTS=${NEW_HOSTS:-any}
+PORTS=${NEW_PORTS:-none}
+PROFILE=$NEW_PROFILE
+SHELL=$NEW_SHELL
+EXTRAS=${NEW_EXTRAS:-none}
+WITH=${NEW_WITH:-none}
+SECRETS=$([ "$NEW_SECRETS" = off ] && printf off || printf auto)
+RECIPE=$(recipe_hash)
+AUTH_HASH=$(auth_hash)
+EOF
+}
+
+cmd_secrets() {
+  printf '  %s%-26s %-26s %-8s %s%s\n' "$C_B" "NAME IN VM" "HOST ENV VAR" "STATE" "HOSTS" "$C_0"
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue;; esac
+    _name=${line%%=*}; _rest=${line#*=}; _env=${_rest%%@*}; _hosts=${_rest#*@}
+    [ "$_hosts" = "$_rest" ] && continue
+    eval "_v=\${$_env:-}"
+    if [ -n "$_v" ]; then
+      printf '  %-26s %-26s %sset%s   %s\n' "$_name" "$_env" "$C_G" "$C_0" "$_hosts"
+    else
+      printf '  %-26s %-26s %sunset%s %s\n' "$_name" "$_env" "$C_DIM" "$C_0" "$_hosts"
+    fi
+  done <<EOF
+$(secret_specs)
+EOF
+  printf '\n  keys are substituted by the shuru proxy on HTTPS requests to those hosts;\n  the real value never enters the VM. Add your own lines to %s\n' "$SECRETS_CONF"
+}
+
+cmd_logs() { _l=$(ls -1t "$LOG_DIR"/*.log 2>/dev/null | head -1); [ -n "$_l" ] || die "no build logs in $LOG_DIR"; log "tail $_l"; tail -n "${1:-100}" "$_l"; }
+
+known_tools() { sed -n 's/^# TOOLS: //p' "$LIB_DIR/with.sh" 2>/dev/null | tr -s ' \n' '\n' | grep -v '^$'; }
+
+cmd_tools() {
+  printf '\n  %son-demand tools%s\n' "$C_B" "$C_0"
+  known_tools | while IFS= read -r t; do
+    printf '    %-12s new --with %-11s newvm-with %s\n' "$t" "$t" "$t"
+  done
+  printf '\n  %sbaked into the image with --extras%s\n' "$C_B" "$C_0"
+  printf '    java ruby php elixir go deno dotnet k8s chromium playwright db\n'
+  printf '    agents aws gcloud terraform ansible\n\n'
+}
+
+cmd_upgrade() {
+  log "upgrading shuru (CLI + OS image)"
+  shuru upgrade || die "shuru upgrade failed"
+  if ckpt_exists "$NEW_BASE"; then
+    warn "'$NEW_BASE' was built for shuru $(meta_get "$NEW_BASE" shuru) - run 'new rebuild' to refresh it"
+  fi
+  ok "shuru upgraded"
+}
+
+resolve_project() {
+  # sets PROJ_DIR / PROJ_SLUG / PROJ_CKPT from PROJ_OVERRIDE (may be empty)
+  # Canonicalise: /tmp and /private/tmp must not produce two different sandboxes.
+  if [ "$NEW_NO_MOUNT" = "1" ]; then PROJ_DIR="$PWD"
+  elif [ -z "$PROJ_DIR" ]; then PROJ_DIR="$PWD"; fi
+  _rp=$(cd "$PROJ_DIR" 2>/dev/null && pwd -P) || _rp="$PROJ_DIR"
+  PROJ_DIR="$_rp"
+  PROJ_SLUG=$(basename "$PROJ_DIR")
+  if [ -z "$PROJ_OVERRIDE" ]; then
+    PROJ_CKPT=$(proj_name "$PROJ_DIR")
+  else
+    PROJ_CKPT=$(slugify "$PROJ_OVERRIDE")
+  fi
+}
+
+cmd_snapshot() {
+  local name ext
+  resolve_project
+  ckpt_exists "$PROJ_CKPT" || die "no saved sandbox for this folder yet - run 'new' first"
+  name=${SNAP_NAME:-$(printf 'snap-%s' "$(date -u +%Y%m%d-%H%M%S)")}
+  name=$(slugify "$name")
+  ckpt_exists "$name" && die "checkpoint '$name' already exists"
+  promote_checkpoint "$PROJ_CKPT" "$name" || die "the snapshot copy failed"
+  ext=$(meta_get "$PROJ_CKPT" disk)
+  meta_upd "$name" path "$PROJ_DIR"; meta_upd "$name" disk "$ext"
+  meta_upd "$name" saved "$(date -u +%FT%TZ)"; meta_upd "$name" parent "$PROJ_CKPT"
+  meta_upd "$name" recipe "$(recipe_hash)"
+  ok "snapshot '$name' created"
+  info "visit it any time with: new restore $name"
+}
+
+cmd_purge_auth() {
+  ckpt_exists "$NEW_BASE" || die "no golden image to scrub"
+  log "removing copied credentials from every checkpoint (this rewrites each image)"
+  local n f name
+  for f in "$CKPT_DIR"/newvm-*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f"); name=${name%.*}
+    shuru checkpoint create "$name.scrub" --from "$name" \
+      --cpus "$NEW_CPUS" --memory "$NEW_MEM" --disk-size "$(resume_disk "$name")" \
+      -- sh -c 'rm -rf /root/.codex /root/.claude /root/.gemini /root/.ssh \
+                     /root/.config/gh /root/.gitconfig /root/.local/share/opencode/auth.json; sync' \
+      >/dev/null 2>&1
+    if ckpt_exists "$name.scrub"; then
+      ckpt_delete "$name"
+      promote_checkpoint "$name.scrub" "$name" && ckpt_delete "$name.scrub"
+      ok "scrubbed '$name'"
+      n=$((n+1))
+    else
+      ckpt_delete "$name.scrub"
+      warn "could not scrub '$name'"
+    fi
+  done
+  purge_payload_credentials
+  rm -rf "$PAYLOAD_DIR" 2>/dev/null
+  ok "done - ${n:-0} checkpoint(s) scrubbed"
+}
+
+cmd_delete() {
+  case "${1:-project}" in
+    project|--project) local n; n=$(proj_name "$(resolve_dir .)"); ckpt_delete "$n"; ckpt_delete "$(prev_name "$n")"
+                      ok "removed this folder's sandbox" ;;
+    *) local n; n=$(slugify "$1"); ckpt_exists "$n" || die "no such checkpoint: $1"
+       ckpt_delete "$n"; ok "deleted '$n'" ;;
+  esac
+}
+
+cmd_clean() {
+  case "${1:-project}" in
+    project|--project)
+      _n=$(proj_name "$(resolve_dir .)"); ckpt_delete "$_n"; ckpt_delete "$(prev_name "$_n")"
+      ok "removed the sandbox checkpoint for $PWD" ;;
+    stages|--stages)
+      for _i in $(seq 1 "$BASE_STAGES"); do ckpt_delete "$NEW_BASE-$_i"; done
+      ok "removed build stages (the golden image is kept)" ;;
+    base|--base)
+      ckpt_delete "$NEW_BASE"; for _i in $(seq 1 "$BASE_STAGES"); do ckpt_delete "$NEW_BASE-$_i"; done
+      ok "removed the golden image - the next 'new' rebuilds it" ;;
+    cache|--cache)
+      shuru prune >/dev/null 2>&1; rm -rf "$PAYLOAD_DIR" "$LOG_DIR"; mkdir -p "$LOG_DIR"
+      ok "pruned VM leftovers and build logs" ;;
+    all|--all)
+      for _f in "$CKPT_DIR"/newvm-* "$CKPT_DIR"/NEWvm-prev-* "$CKPT_DIR"/snap-*; do
+        [ -f "$_f" ] || continue; _b=$(basename "$_f"); _b=${_b%.*}
+        ckpt_delete "$_b"; rm -f "$META_DIR/$_b.meta"
+      done
+      shuru prune >/dev/null 2>&1
+      ok "removed every newvm checkpoint" ;;
+    *) die "unknown target '${1}' (project|stages|base|cache|all)" ;;
+  esac
+}
+
+cmd_doctor() {
+  hr
+  printf '  %shost%s\n' "$C_B" "$C_0"
+  printf '    %-18s %s\n' "shuru" "$(have shuru && shuru --version 2>/dev/null || echo "MISSING - brew tap superhq-ai/tap && brew install shuru")"
+  printf '    %-18s %s\n' "arch" "$(uname -m)$([ "$(uname -m)" = arm64 ] || printf '  <- needs Apple Silicon')"
+  printf '    %-18s %s\n' "macOS" "$(sw_vers -productVersion 2>/dev/null) ($(uname -m))"
+  printf '    %-18s %s\n' "new" "$NEWVM_VERSION"
+  printf '    %-18s %s\n' "golden image" "$(ckpt_exists "$NEW_BASE" && echo "$NEW_BASE ($(human_date "$(meta_get "$NEW_BASE" saved)"))" || echo 'not built')"
+  printf '    %-18s %s\n' "recipe" "$([ "$(meta_get "$NEW_BASE" recipe)" = "$(recipe_hash)" ] && echo 'matches' || echo 'CHANGED - run new rebuild')"
+  printf '    %-18s %s\n' "auth snapshot" "$(auth_hash) (host)"
+  df -h "$HOME" 2>/dev/null | tail -1 | awk '{printf "    %-18s %s free of %s\n","host disk",$4,$2}'
+  printf '    %-18s %s keys set\n' "secrets" "$(secret_names | wc -w | tr -d ' ')"
+  printf '  %simage contents%s\n' "$C_B" "$C_0"
+  if ! have shuru; then
+    printf '    %s(install shuru to inspect the image)%s\n' "$C_DIM" "$C_0"
+  elif ckpt_exists "$NEW_BASE"; then
+    shuru run --config "$STATE_DIR/shuru.json" --from "$NEW_BASE" --cpus "$NEW_CPUS" --memory "$NEW_MEM" \
+      --disk-size "$(resume_disk "$NEW_BASE")" -- newvm-manifest 2>/dev/null | sed 's/^/    /' \
+      || echo '    (could not boot the image)'
+  fi
+  hr
+}
+
+# ---------------------------------------------------------------- the core ---
+resume_disk() {
+  _d=$(meta_get "$1" disk)
+  case "$_d" in ''|*[!0-9]*) _d="$NEW_DISK" ;; esac          # junk in the meta file
+  if [ "$_d" -lt "$NEW_DISK" ] 2>/dev/null; then _d="$NEW_DISK"; fi
+  printf '%s' "$_d"
+}
+
+compose_run_args() {
+  # --config points at a managed file: a shuru.json sitting in the project
+# folder must never be able to redefine mounts, network or secrets for us.
+mkdir -p "$STATE_DIR"
+cat > "$STATE_DIR/shuru.json" <<'SHURUJSON'
+{
+  "_comment": "managed by `new`. Passing it explicitly stops shuru from picking up a shuru.json from the project directory."
+}
+SHURUJSON
+RUN_ARGV=(--config "$STATE_DIR/shuru.json"
+          --cpus "$NEW_CPUS" --memory "$NEW_MEM" --disk-size "$RESUME_DISK")
+  if [ "$NEW_NET" != "off" ]; then
+    RUN_ARGV+=(--allow-net)
+    if [ -n "$NEW_HOSTS" ]; then
+      _old=$IFS; IFS=','
+      for _h in $NEW_HOSTS; do [ -n "$_h" ] && RUN_ARGV+=(--allow-host "$_h"); done
+      IFS=$_old
+    fi
+    [ "$NEW_SECRETS" = "on" ] && collect_secrets
+  fi
+  if [ -n "$NEW_PORTS" ]; then
+    _old=$IFS; IFS=','
+    for _p in $NEW_PORTS; do
+      case "$_p" in ''|'#'*) continue;; esac
+      case "$_p" in *:*) RUN_ARGV+=(-p "$_p");; *) RUN_ARGV+=(-p "$_p:$_p");; esac
+    done
+    IFS=$_old
+  fi
+  if [ "$NEW_MOUNT" != "none" ] && [ -n "$PROJ_DIR" ] && [ "$NEW_NO_MOUNT" != "1" ]; then
+    RUN_ARGV+=(--mount "$PROJ_DIR:$GUEST_WORKSPACE:$NEW_MOUNT")
+    [ "$NEW_MOUNT" = "rw" ] && RUN_ARGV+=(--allow-host-writes)
+  fi
+  if [ -n "$EXTRA_ARGS" ]; then
+    while IFS= read -r line; do
+      case "$line" in ''|'#'*) continue;; esac
+      set -f
+      for w in $line; do RUN_ARGV+=("$w"); done
+      set +f
+    done <<EXTRAEOF
+$EXTRA_ARGS
+EXTRAEOF
+  fi
+}
+
+# Appends --secret NAME=ENV@hosts for every host key that is set.
+collect_secrets() {
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue;; esac
+    name=${line%%=*}; rest=${line#*=}; envvar=${rest%%@*}; hosts=${rest#*@}
+    [ "$hosts" = "$rest" ] && continue
+    eval "_v=\${$envvar:-}"
+    [ -n "$_v" ] || continue
+    RUN_ARGV+=(--secret "${name}=${envvar}@${hosts}")
+  done <<SECRETEOF
+$(secret_specs)
+SECRETEOF
+}
+
+session_argv() { # fills GUEST_ARGV
+  GUEST_ARGV=(newvm-session
+    --project "$(slugify "$PROJ_SLUG")"   # display only
+    --checkpoint "$(slugify "$PROJ_CKPT")"
+    --parent "$(slugify "$parent")"
+    --save "$save"
+    --workspace "$GUEST_WORKSPACE"
+    --shell "$(printf '%s' "$NEW_SHELL" | tr -d ' ')"
+    --with "$(printf '%s' "$NEW_WITH" | tr -d ' ')"
+    --sync-auth "$NEW_SYNC_AUTH"
+    --mountmode "$NEW_MOUNT"
+    --hostdir "$PROJ_DIR"
+    --cpus "$NEW_CPUS" --memory "$NEW_MEM" --disk "$RESUME_DISK"
+    --secrets "$(secret_names | tr -s ' ' ' ')"
+    --version-tag "$NEWVM_VERSION")
+  if [ -n "$CMD_OVERRIDE" ]; then
+    GUEST_ARGV+=(--cmd "$CMD_OVERRIDE")
+  fi
+}
+
+run_session() {
+  local save="$NEW_SAVE" parent rc
+  local shuru_mode="run" from_ckpt=""
+
+  if [ "$FRESH" = "1" ] && ckpt_exists "$PROJ_CKPT"; then
+    log "--fresh: dropping the saved sandbox for this folder"
+    ckpt_delete "$PROJ_CKPT"
+  fi
+  if [ -n "$FROM_CKPT" ]; then
+    parent="$FROM_CKPT"
+    ckpt_exists "$parent" || die "checkpoint '$parent' not found (see: new list)"
+  else
+    parent="$PROJ_CKPT"
+    if ! ckpt_exists "$parent"; then
+      parent="$NEW_BASE"
+      [ "$save" = "auto" ] && save="always"
+    fi
+  fi
+  RESUME_DISK=$(resume_disk "$parent")
+
+  compose_run_args
+  session_argv
+  build_payload
+  payload_cmd "$PROJ_CKPT" session none "${GUEST_ARGV[@]}" || die "payload build failed"
+  purge_payload_credentials   # the guest already has its copy
+
+  # Lock first: everything below mutates checkpoints, and two shells in the
+  # same folder racing each other can lose a saved session.
+  lock_acquire "$PROJ_CKPT" "${PROJ_DIR:-$PWD}"
+  trap 'lock_release' EXIT INT TERM
+
+  if [ "$save" = "never" ]; then
+    shuru_mode="run"; from_ckpt="$parent"
+    info "ephemeral: guest changes are discarded on exit (the golden image stays)"
+  else
+    shuru_mode="create"
+    if ckpt_exists "$PROJ_CKPT"; then
+      ckpt_delete "$(prev_name "$PROJ_CKPT")"
+      info "rolling the saved sandbox forward"
+      move_checkpoint "$PROJ_CKPT" "$(prev_name "$PROJ_CKPT")" || die "could not stage the previous state"
+      meta_upd "$(prev_name "$PROJ_CKPT")" path "$PROJ_DIR"
+      meta_upd "$(prev_name "$PROJ_CKPT")" disk "$RESUME_DISK"
+      from_ckpt="$(prev_name "$PROJ_CKPT")"
+    else
+      from_ckpt="$parent"
+    fi
+    info "on exit, this session is saved as '$PROJ_CKPT'"
+  fi
+
+  hr
+  log "booting $PROJ_SLUG"
+  info "$NEW_CPUS cpus / $NEW_MEM MB ram / $RESUME_DISK MB disk"
+  info "from checkpoint '$from_ckpt'"
+  [ "$NEW_MOUNT" != "none" ] && [ -n "$PROJ_DIR" ] && info "project folder mounted at $GUEST_WORKSPACE ($NEW_MOUNT)"
+  [ -n "$NEW_PORTS" ] && info "forwarded ports: $NEW_PORTS"
+  { [ "$NEW_SECRETS" = "on" ] && [ "$NEW_NET" != "off" ]; } && info "keys wired:$(secret_names)"
+  hr
+
+  if [ "$NEW_MOUNT" != "none" ] && [ -n "$PROJ_DIR" ] && [ "$PROJ_DIR" != "$PWD" ]; then
+    cd "$PROJ_DIR" || die "cannot cd to $PROJ_DIR"   # shuru only mounts paths inside $PWD
+  fi
+
+  if [ "$shuru_mode" = "create" ]; then
+    shuru checkpoint create "$PROJ_CKPT" --from "$from_ckpt" "${RUN_ARGV[@]}" \
+      -- "${BOOT_ARGV[@]}"
+  else
+    shuru run --from "$from_ckpt" "${RUN_ARGV[@]}" -- "${BOOT_ARGV[@]}"
+  fi
+  rc=$?
+
+  lock_release
+  trap - EXIT INT TERM
+
+  if [ "$save" != "never" ] && ckpt_exists "$PROJ_CKPT"; then
+    meta_upd "$PROJ_CKPT" path "$PROJ_DIR"
+    meta_upd "$PROJ_CKPT" disk "$RESUME_DISK"
+    meta_upd "$PROJ_CKPT" saved "$(date -u +%FT%TZ)"
+    meta_upd "$PROJ_CKPT" recipe "$(recipe_hash)"
+    meta_upd "$PROJ_CKPT" parent "$from_ckpt"
+    meta_upd "$PROJ_CKPT" auth "$(auth_hash)"
+    ckpt_delete "$(prev_name "$PROJ_CKPT")"
+    ok "sandbox saved as '$PROJ_CKPT'"
+    info "run 'new' in this folder again to resume exactly this state"
+  elif [ "$save" != "never" ]; then
+    warn "the session ended but no checkpoint was written (exit $rc)"
+  fi
+  return $rc
+}
+
+usage() {
+  local tools; tools=$(sed -n 's/^# TOOLS: //p' "$LIB_DIR/with.sh" 2>/dev/null | tr -s ' ' ' ')
+  cat <<EOF
+
+${C_B}new${C_0} - ephemeral microVM dev sandbox for any folder
+             (shuru microVM, ${NEW_MEM}MB ram, ${NEW_DISK}MB disk, full toolchain, auto checkpoint)
+
+${C_B}USAGE${C_0}
+  new [dir] [options]        boot a sandbox for dir (default: this folder)
+  new enter [ckpt]           go inside a checkpoint (default: this folder's)
+  new exit                   leave the current sandbox (alias: type 'exit')
+  new restore NAME           boot a snapshot read-only, save nothing
+  new snapshot [NAME]        instant named copy of this folder's sandbox
+  new delete [ckpt]          delete a checkpoint (default: this folder's)
+  new shell                  same as 'new' (explicit interactive shell)
+  new run -- CMD             same as 'new -- CMD'
+  new tools                  the on-demand tool list
+  new upgrade                upgrade shuru, then rebuild if needed
+  new list                   checkpoints, stages, sizes
+  new status                 what would happen right now for this folder
+  new env                    resolved settings
+  new secrets                which API keys get wired in
+  new build [stage]          build the golden toolchain image only
+  new rebuild [stage]        delete it and build it again
+  new clean [target]         project (default) | stages | base | cache | all
+  new logs [n]               tail the last build log
+  new doctor                 host + image health check
+  new purge-auth             strip copied credentials out of every checkpoint
+  new unlock                 clear a stale lock left by a crashed session
+  new --help                 this text
+
+${C_B}LIFE OF A SESSION${C_0}
+  new        -> boots a throwaway clone of $NEW_BASE, mounts this folder
+  ... work ... install anything, run codex/claude/opencode freely
+  exit       -> the sandbox saves itself as a checkpoint (auto)
+  new again  -> boots that checkpoint again: ~0.3s, everything still there
+  new --ephemeral  -> guest disk changes are thrown away on exit. The golden
+                      image and the on-disk checkpoints are NOT deleted.
+  new clean project   -> forget this folder's sandbox
+  new clean base      -> drop the golden image; the next new rebuilds it
+
+${C_B}REQUIREMENTS${C_0}
+  macOS 14+ on Apple Silicon, Homebrew, and shuru:
+    brew tap superhq-ai/tap && brew install shuru
+  First run builds a toolchain image once (10-30 min, resumable, ~5 GB on disk).
+  Run 'new build' ahead of time to do it without waiting.
+
+${C_B}RELATIONSHIP TO SHURU${C_0}
+  new is a thin wrapper around the shuru CLI (Apache-2.0, github.com/superhq-ai/shuru)
+  and stores nothing outside ~/.local/share/newvm and ~/.local/share/shuru.
+  You can use any checkpoint new creates directly with shuru, and vice versa.
+
+${C_B}HOST CREDENTIALS${C_0}
+  API keys given as environment variables (--secret) never enter the VM: the
+  guest gets a placeholder and shuru's proxy substitutes the value per request.
+  By default (NEW_SYNC_AUTH=1) your existing agent LOGIN files are copied into
+  the sandbox so codex/claude stay signed in - those are real credentials on
+  the host disk. Use --no-sync-auth to stop that.
+
+${C_B}RESOURCES${C_0}
+  -m, --memory MB            ram (default ${NEW_MEM})
+  -c, --cpus N               cores (default ${NEW_CPUS})
+  -d, --disk MB              disk (default ${NEW_DISK})
+
+${C_B}SESSION${C_0}
+  -n, --name NAME            checkpoint name for this project
+      --from NAME            boot from a specific checkpoint
+      --fresh                ignore the saved sandbox, start clean
+      --cmd "CMD"            run a command instead of the shell
+      --shell SHELL          shell to launch (default ${NEW_SHELL})
+      --ephemeral            never save on exit
+      --save MODE            auto (default) | always | never
+      --with TOOL            install a tool at session start (repeatable)
+                             available: ${tools}
+      --profile core|full    which image to boot
+
+${C_B}FILESYSTEM${C_0}   (ephemeral rules: the golden image is never modified,
+                            guest disk state is discarded unless you save,
+                            and /workspace writes are RAM-only unless --rw)
+      --isolated             overlay mount: writes stay in RAM, never the host
+      --rw                   read-write mount: writes land in the host folder
+                             (the guest then has write access to your project)
+      --no-mount             no host directory at all
+
+${C_B}NETWORK${C_0}
+      --no-net               no network device at all
+      --net-hosts a,b,c      restrict egress to these domains
+      --ports 3000,5173:5173 forward host ports into the guest
+      --secret N=ENV@h1,h2   inject a key (repeatable)
+      --no-secrets           do not wire any API keys
+
+${C_B}IMAGE${C_0}
+      --rebuild-base         rebuild the golden toolchain image
+      --no-build             fail instead of building a missing image
+      --sync-auth            copy host agent credentials into the image (default)
+      --no-sync-auth         never copy host credentials
+      --extras a,b           add tool groups when building the image
+
+${C_B}EXAMPLES${C_0}
+  new                                  work on this folder, auto-saved
+  new ~/code/api --isolated            scratch space, host untouched
+  new --with playwright --ports 3000   extra tooling + a forwarded dev server
+  new --cmd 'codex exec "add tests"'   one-shot agent run
+  new clean base && new                brand new toolchain, clean state
+
+${C_B}EXIT CODES${C_0}
+  0 success   1 runtime failure   2 usage error
+
+${C_B}ENVIRONMENT${C_0}
+  NEW_MEM NEW_CPUS NEW_DISK NEW_SAVE NEW_MOUNT NEW_PROFILE NEW_BASE NEW_NET
+  NEW_SECRETS NEW_SYNC_AUTH NEW_SYNC_SSH NEW_SYNC_GITCONFIG NEW_EXTRAS
+  NEW_PORTS NEW_HOSTS NEW_WITH NEW_BASE NEW_SHELL NEW_NO_BUILD
+  (defaults: $APP_DIR/config.env, overrides: $CFG)
+
+EOF
+}
+
+usage_error() { err "$*"; printf 'try: new --help\n' >&2; exit 2; }
+
+# -------------------------------------------------------------------- main ---
+main() {
+  # --help / --version must work before anything else can fail, including a
+  # missing shuru: they are the first thing a new user runs.
+  case "${1:-}" in
+    -h|--help|help)
+      load_config; apply_defaults; usage; exit 0 ;;
+    -V|--version)
+      printf 'new %s%s\n' "$NEWVM_VERSION" "$(have shuru && printf ' (shuru %s)' "$(shuru --version 2>/dev/null)")"
+      exit 0 ;;
+  esac
+
+  case "${1:-}" in
+    doctor) SHURU_OPTIONAL=1 ;;
+  esac
+
+  mkdirs
+  [ -f "$LIB_DIR/provision.sh" ] || die "installation incomplete: $LIB_DIR/provision.sh is missing"
+  load_config
+  apply_defaults
+
+  FRESH=0; FROM_CKPT=""; CMD_OVERRIDE=""; EXTRA_ARGS=""; PROJ_OVERRIDE=""
+  PASSTHRU=(); NEW_NO_MOUNT=0; want_rebuild=0
+  ENTER_CKPT=""; RESTORE_CKPT=""; SNAP_NAME=""; CMD_REQUIRED=0
+  PROJ_DIR="$PWD"; PROJ_SLUG=$(basename "$PWD")
+  resolve_project
+
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      list)    shift; cmd_list;    exit 0 ;;
+      status)  shift; cmd_status;  exit 0 ;;
+      env)     shift; cmd_env;     exit 0 ;;
+      secrets) shift; cmd_secrets; exit 0 ;;
+      logs)    shift; cmd_logs "${1:-100}"; exit 0 ;;
+      build)   shift; _st="${1:-}"; [ -n "$_st" ] && shift; NEW_NO_BUILD=0
+               ensure_base 0 "$_st" || exit 1; exit 0 ;;
+      rebuild) shift; _st="${1:-}"; [ -n "$_st" ] && shift; NEW_NO_BUILD=0
+               ensure_base 1 "$_st" || exit 1; exit 0 ;;
+      clean)   shift; cmd_clean "${1:-project}"; exit 0 ;;
+      doctor)  shift; cmd_doctor;  exit 0 ;;
+      tools)   shift; cmd_tools;   exit 0 ;;
+      purge-auth) shift; cmd_purge_auth; exit 0 ;;
+      unlock)  shift; rm -rf "$STATE_DIR"/lock-* 2>/dev/null; ok "cleared stale locks"; exit 0 ;;
+      upgrade) shift; cmd_upgrade; exit 0 ;;
+      snapshot|snap) shift; SNAP_NAME="${1:-}"; cmd_snapshot; exit 0 ;;
+      delete|rm)    shift; cmd_delete "${1:-project}"; exit 0 ;;
+      enter|open|attach) shift; ENTER_CKPT="${1:-}"; [ $# -gt 0 ] && shift ;;
+      restore) shift; RESTORE_CKPT="${1:?restore needs a checkpoint name}"; shift ;;
+      shell|sh) shift ;;
+      run) shift; CMD_REQUIRED=1 ;;
+      exit) usage_error "to leave a sandbox, type 'exit' (or Ctrl-D) inside it" ;;
+      help)    usage; exit 0 ;;
+    esac
+  fi
+
+  if ! have shuru; then
+    die "shuru not found - install it with: brew tap superhq-ai/tap && brew install shuru"
+  fi
+
+  while [ $# -gt 0 ]; do
+    _a="$1"
+    case "$_a" in
+      -h|--help)      usage; exit 0 ;;
+      -V|--version)   printf 'new %s%s\n' "$NEWVM_VERSION" "$(have shuru && printf ' (shuru %s)' "$(shuru --version 2>/dev/null)")"; exit 0 ;;
+      -m|--memory)    NEW_MEM="${2:?}"; shift ;;
+      --memory=*)     NEW_MEM="${_a#*=}" ;;
+      -c|--cpus)      NEW_CPUS="${2:?}"; shift ;;
+      --cpus=*)       NEW_CPUS="${_a#*=}" ;;
+      -d|--disk)      NEW_DISK="${2:?}"; shift ;;
+      --disk=*)       NEW_DISK="${_a#*=}" ;;
+      -n|--name)      PROJ_OVERRIDE="${2:?}"; shift ;;
+      --name=*)       PROJ_OVERRIDE="${_a#*=}" ;;
+      --from)         FROM_CKPT="${2:?}"; shift ;;
+      --from=*)       FROM_CKPT="${_a#*=}" ;;
+      --base)         NEW_BASE="${2:?}"; shift ;;
+      --base=*)       NEW_BASE="${_a#*=}" ;;
+      --cmd)          CMD_OVERRIDE="${2:?}"; shift ;;
+      --cmd=*)        CMD_OVERRIDE="${_a#*=}" ;;
+      --shell)        NEW_SHELL="${2:?}"; shift ;;
+      --shell=*)      NEW_SHELL="${_a#*=}" ;;
+      --save)         NEW_SAVE="${2:?}"; shift ;;
+      --save=*)       NEW_SAVE="${_a#*=}" ;;
+      --save-always)  NEW_SAVE=always ;;
+      --no-save|--ephemeral) NEW_SAVE=never ;;
+      --with)         NEW_WITH="${NEW_WITH:+$NEW_WITH,}${2:?}"; shift ;;
+      --with=*)       NEW_WITH="${NEW_WITH:+$NEW_WITH,}${_a#*=}" ;;
+      --net-hosts)    NEW_HOSTS="${2:?}"; shift ;;
+      --net-hosts=*)  NEW_HOSTS="${_a#*=}" ;;
+      --ports)        NEW_PORTS="${NEW_PORTS:+$NEW_PORTS,}${2:?}"; shift ;;
+      --ports=*)      NEW_PORTS="${NEW_PORTS:+$NEW_PORTS,}${_a#*=}" ;;
+      --profile)      NEW_PROFILE="${2:?}"; shift ;;
+      --profile=*)    NEW_PROFILE="${_a#*=}" ;;
+      --extras)       NEW_EXTRAS="${NEW_EXTRAS:+$NEW_EXTRAS,}${2:?}"; shift ;;
+      --extras=*)     NEW_EXTRAS="${NEW_EXTRAS:+$NEW_EXTRAS,}${_a#*=}" ;;
+      --secret)       EXTRA_ARGS="$EXTRA_ARGS
+--secret ${2:?}"; shift ;;
+      --secret=*)     EXTRA_ARGS="$EXTRA_ARGS
+--secret ${_a#*=}" ;;
+      --allow-host)   EXTRA_ARGS="$EXTRA_ARGS
+--allow-host ${2:?--allow-host needs a pattern}"; shift ;;
+      --allow-host=*) EXTRA_ARGS="$EXTRA_ARGS
+--allow-host ${_a#*=}" ;;
+      --rebuild-base) want_rebuild=1 ;;
+      --unlock)       rm -rf "$STATE_DIR"/lock-* 2>/dev/null; ok "cleared stale locks"; exit 0 ;;
+      --no-build)     NEW_NO_BUILD=1 ;;
+      --fresh)        FRESH=1 ;;
+      --sync-auth)    NEW_SYNC_AUTH=1 ;;
+      --no-sync-auth) NEW_SYNC_AUTH=0 ;;
+      --isolated)     NEW_MOUNT=ro ;;
+      --rw)           NEW_MOUNT=rw ;;
+      --no-mount)     NEW_MOUNT=none; NEW_NO_MOUNT=1 ;;
+      --no-net)       NEW_NET=off ;;
+      --no-secrets)   NEW_SECRETS=off ;;
+      --no-color)     C_DIM=""; C_B=""; C_R=""; C_G=""; C_Y=""; C_C=""; C_0="" ;;
+      --)             shift; while [ $# -gt 0 ]; do PASSTHRU[${#PASSTHRU[@]}]="$1"; shift; done; break ;;
+      --allow-net|-v|--verbose|--console|--initrd|--kernel|--rootfs|--dns-resolver|--port|-p)
+                        EXTRA_ARGS="$EXTRA_ARGS
+$_a" ;;
+      -*)             warn "unknown option '$_a' is being passed through to shuru"; EXTRA_ARGS="$EXTRA_ARGS
+$_a" ;;
+      list|status|env|secrets|tools|logs|doctor|snapshot|snap|delete|rm|enter|open|attach|restore|shell|sh|run|clean|build|rebuild|upgrade|purge-auth|unlock)
+                    # a subcommand may also appear after flags
+                    _sub="$_a"; shift; _sub_args="$*"; break ;;
+      *)              if [ -d "$_a" ]; then PROJ_DIR=$(resolve_dir "$_a"); else usage_error "'$_a' is not a directory"; fi ;;
+    esac
+    shift
+  done
+
+  if [ -n "$ENTER_CKPT" ]; then
+    _c=$(slugify "$ENTER_CKPT")
+    ckpt_exists "$_c" || die "no such checkpoint: $ENTER_CKPT (see: new list)"
+    PROJ_OVERRIDE="$_c"; FROM_CKPT="$_c"; [ "$NEW_SAVE" = "auto" ] && NEW_SAVE=always
+    log "entering '$_c' - your state is written back to it when you leave"
+  fi
+  if [ -n "$RESTORE_CKPT" ]; then
+    _c=$(slugify "$RESTORE_CKPT")
+    ckpt_exists "$_c" || die "no such checkpoint: $RESTORE_CKPT (see: new list)"
+    FROM_CKPT="$_c"; [ "$NEW_SAVE" = "auto" ] && NEW_SAVE=never
+    log "restoring '$_c' read-only (pass --save always to write it into this folder)"
+  fi
+  if [ "${#PASSTHRU[@]}" -gt 0 ]; then
+    if [ "$CMD_REQUIRED" = "1" ] && [ -z "$CMD_OVERRIDE" ]; then
+      CMD_OVERRIDE="${PASSTHRU[*]}"
+    else
+      # everything after -- is a command for the guest
+      CMD_OVERRIDE="${PASSTHRU[*]}"
+    fi
+  fi
+
+  # dispatch a subcommand that appeared after flags
+  if [ -n "${_sub:-}" ]; then
+    case "$_sub" in
+      list) cmd_list;; status) cmd_status;; env) cmd_env;; secrets) cmd_secrets;;
+      tools) cmd_tools;; logs) cmd_logs "${_sub_args:-100}";; doctor) cmd_doctor;;
+      snapshot|snap) SNAP_NAME="${_sub_args%% *}"; cmd_snapshot;;
+      delete|rm) cmd_delete "${_sub_args:-project}";; enter|open|attach|restore) : ;;
+      clean) cmd_clean "${_sub_args:-project}";; build|rebuild) : ;;
+      shell|sh|run|purge-auth|unlock) : ;;
+    esac
+    if [ -n "${_sub:-}" ] && [ "${_sub#shell}" = "$_sub" ] && [ "${_sub#sh}" = "$_sub" ] \
+       && [ "$_sub" != run ] && [ "$_sub" != purge-auth ] && [ "$_sub" != unlock ]; then
+      exit 0
+    fi
+  fi
+
+  case "$NEW_SAVE"   in auto|always|never) ;; *) usage_error "--save must be auto|always|never" ;; esac
+  case "$NEW_MOUNT"  in rw|ro|none)        ;; *) usage_error "mount mode must be rw|ro|none" ;; esac
+
+  if [ -n "$PROJ_DIR" ]; then
+    PROJ_DIR=$(resolve_dir "$PROJ_DIR")
+    [ "$PROJ_DIR" = "/" ] && die "refusing to use '/' - cd into a project folder (or pass --no-mount)"
+  fi
+  resolve_project
+  RESUME_DISK="$NEW_DISK"
+
+  if [ ! -t 0 ] && [ -z "$CMD_OVERRIDE" ]; then
+    usage_error "stdin is not a terminal - pass a command: new --cmd 'your command'"
+  fi
+
+  ensure_base "$want_rebuild" || die "the golden image is not ready - fix the errors above, then run 'new' again"
+  run_session
+}
+
+main "$@"
