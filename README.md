@@ -234,6 +234,11 @@ It leaves `shuru` installed, since that is a separate project.
 
 ---
 
+## Every command
+
+Full reference for every command, flag, setting and troubleshooting case:
+[COMMANDS.md](COMMANDS.md).
+
 ## Working on the code
 
 ```sh
